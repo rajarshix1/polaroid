@@ -22,6 +22,7 @@ import * as MediaLibrary from 'expo-media-library/legacy';
 import { PolaroidCard } from './src/components/PolaroidCard';
 import { ShutterButton } from './src/components/ShutterButton';
 import { DevelopingPhoto } from './src/components/DevelopingPhoto';
+import { LiveFilterOverlay } from './src/components/LiveFilterOverlay';
 import { developPolaroid, type DevelopedPhoto } from './src/filters/polaroid';
 
 const ALBUM_TITLE = 'Polar';
@@ -62,10 +63,11 @@ export default function App() {
   const [asked, setAsked] = useState(false);
   const [cameraRef, setCameraRef] = useState<CameraView | null>(null);
 
-  const { width, height } = Dimensions.get('window');
-  const squareSize = Math.floor(width - 56);
-  const squareTop = Math.floor((height - squareSize) / 2);
-  const squareLeft = Math.floor((width - squareSize) / 2);
+  const { width } = Dimensions.get('window');
+  // 4:3 viewfinder; the print is the centered square inside it.
+  const previewWidth = width;
+  const previewHeight = Math.floor((width * 4) / 3);
+  const squareTop = Math.floor((previewHeight - previewWidth) / 2);
   const cardPhotoSize = Math.floor(width - 48);
 
   const camGranted = camPermission?.granted === true;
@@ -164,17 +166,15 @@ export default function App() {
       }
 
       // Auto-save, like a real Polaroid: the print exists the moment it is taken.
+      // Saved straight into the album (never moved), so Android never asks to "modify".
       try {
         if (!mediaGranted) {
           await requestMediaPermission();
         }
-        const asset = await MediaLibrary.createAssetAsync(finished.uri);
-        const album = await MediaLibrary.getAlbumAsync(ALBUM_TITLE).catch(() => null);
-        if (album) {
-          await MediaLibrary.addAssetsToAlbumAsync(asset, album, false);
-        } else {
-          await MediaLibrary.createAlbumAsync(ALBUM_TITLE, asset, false);
-        }
+        const album =
+          (await MediaLibrary.getAlbumAsync(ALBUM_TITLE).catch(() => null)) ??
+          (await MediaLibrary.createAlbumAsync(ALBUM_TITLE).catch(() => null));
+        await MediaLibrary.createAssetAsync(finished.uri, album ?? undefined);
       } catch (e) {
         console.warn('Auto-save failed', e);
       }
@@ -288,54 +288,47 @@ export default function App() {
           )}
         </View>
       ) : (
-        // ---- Fullscreen viewfinder ----
+        // ---- 4:3 viewfinder over black ----
         <View style={styles.finder}>
-          <CameraView
-            ref={setCameraRef}
-            style={styles.camera}
-            facing={facing}
-            flash={flash}
-            mirror={false}
-            animateShutter
-            onCameraReady={() => setCameraReady(true)}
-            onMountError={() => setError('Camera would not start')}
-          />
-          {/* Square crop guide: the print is square, dim the rest. */}
-          <View pointerEvents="none" style={[styles.dim, { top: 0, left: 0, right: 0, height: squareTop }]} />
           <View
-            pointerEvents="none"
-            style={[styles.dim, { top: squareTop + squareSize, left: 0, right: 0, bottom: 0 }]}
-          />
-          <View
-            pointerEvents="none"
-            style={[styles.dim, { top: squareTop, left: 0, width: squareLeft, height: squareSize }]}
-          />
-          <View
-            pointerEvents="none"
-            style={[
-              styles.dim,
-              { top: squareTop, right: 0, width: squareLeft, height: squareSize },
-            ]}
-          />
-          <View
-            pointerEvents="none"
-            style={[
-              styles.guide,
-              { top: squareTop, left: squareLeft, width: squareSize, height: squareSize },
-            ]}
-          />
-          {/* Live warmth hint so the viewfinder feels like the print. */}
-          <View
-            pointerEvents="none"
-            style={[
-              styles.liveTint,
-              { top: squareTop, left: squareLeft, width: squareSize, height: squareSize },
-            ]}
-          />
-
-          <View style={styles.topBar}>
-            <Text style={styles.title}>POLAR</Text>
-            <View style={styles.topButtons}>
+            style={[styles.previewBox, { width: previewWidth, height: previewHeight }]}
+          >
+            <CameraView
+              ref={setCameraRef}
+              style={styles.camera}
+              facing={facing}
+              flash={flash}
+              mirror={false}
+              animateShutter
+              onCameraReady={() => setCameraReady(true)}
+              onMountError={() => setError('Camera would not start')}
+              {...(Platform.OS === 'android' ? { ratio: '4:3' as const } : null)}
+            />
+            {/* Dim the 4:3 margins: the print is the centered square. */}
+            <View
+              pointerEvents="none"
+              style={[styles.dim, { top: 0, left: 0, right: 0, height: squareTop }]}
+            />
+            <View
+              pointerEvents="none"
+              style={[
+                styles.dim,
+                { top: squareTop + previewWidth, left: 0, right: 0, bottom: 0 },
+              ]}
+            />
+            {/* Live Polaroid grade on the square that becomes the print. */}
+            <View pointerEvents="none" style={{ position: 'absolute', top: squareTop, left: 0 }}>
+              <LiveFilterOverlay size={previewWidth} />
+            </View>
+            <View
+              pointerEvents="none"
+              style={[
+                styles.guide,
+                { top: squareTop, left: 0, width: previewWidth, height: previewWidth },
+              ]}
+            />
+            <View style={styles.previewTop}>
+              <Text style={styles.brand}>POLAR</Text>
               <TouchableOpacity
                 hitSlop={12}
                 accessibilityRole="button"
@@ -344,49 +337,52 @@ export default function App() {
                   setFlash(FLASH_ORDER[(FLASH_ORDER.indexOf(flash) + 1) % FLASH_ORDER.length]);
                 }}
               >
-                <Ionicons name={FLASH_ICON[flash]} size={26} color="#f5f2e8" />
-              </TouchableOpacity>
-              <TouchableOpacity
-                hitSlop={12}
-                accessibilityRole="button"
-                accessibilityLabel="Flip camera"
-                onPress={() => setFacing((f) => (f === 'back' ? 'front' : 'back'))}
-              >
-                <Ionicons name="camera-reverse-outline" size={28} color="#f5f2e8" />
+                <Ionicons name={FLASH_ICON[flash]} size={24} color="#f5f2e8" />
               </TouchableOpacity>
             </View>
           </View>
 
-          <View style={styles.bottomBar}>
-            <TouchableOpacity
-              style={styles.thumb}
-              disabled={film.length === 0}
-              onPress={() => {
-                const last = film[0];
-                if (last) {
-                  setShot({ ...last, caption: last.caption || todayCaption() });
-                }
-              }}
-            >
-              {film[0] ? (
-                <Image source={{ uri: film[0].uri }} style={styles.thumbImage} contentFit="cover" />
-              ) : (
-                <View style={styles.thumbEmpty} />
-              )}
-            </TouchableOpacity>
-            <ShutterButton onPress={takePhoto} disabled={!cameraReady || working} />
-            <View style={styles.thumbSpacer} />
+          <View style={styles.blackZone}>
+            <Text style={styles.writeup}>600 FILM · POINT. SHOOT. PRINT.</Text>
+            <View style={styles.controls}>
+              <TouchableOpacity
+                style={styles.thumb}
+                disabled={film.length === 0}
+                onPress={() => {
+                  const last = film[0];
+                  if (last) {
+                    setShot({ ...last, caption: last.caption || todayCaption() });
+                  }
+                }}
+              >
+                {film[0] ? (
+                  <Image
+                    source={{ uri: film[0].uri }}
+                    style={styles.thumbImage}
+                    contentFit="cover"
+                  />
+                ) : (
+                  <View style={styles.thumbEmpty} />
+                )}
+              </TouchableOpacity>
+              <ShutterButton onPress={takePhoto} disabled={!cameraReady || working} />
+              <TouchableOpacity
+                hitSlop={12}
+                accessibilityRole="button"
+                accessibilityLabel="Flip camera"
+                style={styles.iconButton}
+                onPress={() => setFacing((f) => (f === 'back' ? 'front' : 'back'))}
+              >
+                <Ionicons name="camera-reverse-outline" size={30} color="#f5f2e8" />
+              </TouchableOpacity>
+            </View>
+            {!!error && !working && <Text style={styles.error}>{error}</Text>}
           </View>
 
           {working && (
             <View style={styles.working}>
               <ActivityIndicator size="large" color="#f5f2e8" />
               <Text style={styles.hint}>Developing film…</Text>
-            </View>
-          )}
-          {!!error && !working && (
-            <View style={styles.errorWrap}>
-              <Text style={styles.error}>{error}</Text>
             </View>
           )}
         </View>
@@ -396,12 +392,12 @@ export default function App() {
   );
 }
 
-const TOP_PAD = Platform.OS === 'android' ? (RNStatusBar.currentHeight ?? 0) + 12 : 60;
+const TOP_PAD = Platform.OS === 'android' ? (RNStatusBar.currentHeight ?? 0) + 8 : 56;
 
 const styles = StyleSheet.create({
   screen: {
     flex: 1,
-    backgroundColor: '#0e0e0f',
+    backgroundColor: '#000',
   },
   center: {
     alignItems: 'center',
@@ -414,11 +410,25 @@ const styles = StyleSheet.create({
     letterSpacing: 6,
     color: '#f5f2e8',
   },
+  brand: {
+    fontSize: 16,
+    fontWeight: '800',
+    letterSpacing: 5,
+    color: '#f5f2e8',
+    textShadowColor: 'rgba(0,0,0,0.6)',
+    textShadowRadius: 6,
+  },
   hint: {
     fontSize: 13,
     color: '#8a8574',
     textAlign: 'center',
     marginTop: 8,
+  },
+  writeup: {
+    fontSize: 12,
+    letterSpacing: 3,
+    color: '#8a8574',
+    textAlign: 'center',
   },
   permList: {
     marginTop: 28,
@@ -465,6 +475,11 @@ const styles = StyleSheet.create({
   finder: {
     flex: 1,
   },
+  previewBox: {
+    marginTop: TOP_PAD,
+    backgroundColor: '#111',
+    overflow: 'hidden',
+  },
   camera: {
     position: 'absolute',
     left: 0,
@@ -481,36 +496,35 @@ const styles = StyleSheet.create({
     borderWidth: 1.5,
     borderColor: 'rgba(245,242,232,0.6)',
   },
-  liveTint: {
-    position: 'absolute',
-    backgroundColor: 'rgba(255,190,120,0.10)',
-  },
-  topBar: {
+  previewTop: {
     position: 'absolute',
     top: 0,
     left: 0,
     right: 0,
-    paddingTop: TOP_PAD,
-    paddingHorizontal: 20,
-    paddingBottom: 12,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
+    paddingHorizontal: 16,
+    paddingTop: 10,
   },
-  topButtons: {
-    flexDirection: 'row',
+  blackZone: {
+    flex: 1,
     alignItems: 'center',
+    justifyContent: 'center',
     gap: 22,
+    paddingHorizontal: 24,
+    paddingBottom: 24,
   },
-  bottomBar: {
-    position: 'absolute',
-    bottom: 44,
-    left: 0,
-    right: 0,
+  controls: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    paddingHorizontal: 36,
+    alignSelf: 'stretch',
+    paddingHorizontal: 12,
+  },
+  iconButton: {
+    width: 52,
+    alignItems: 'center',
   },
   thumb: {
     width: 52,
@@ -528,9 +542,6 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: 'rgba(28,28,30,0.7)',
   },
-  thumbSpacer: {
-    width: 52,
-  },
   working: {
     position: 'absolute',
     left: 0,
@@ -542,13 +553,6 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     gap: 10,
   },
-  errorWrap: {
-    position: 'absolute',
-    bottom: 130,
-    left: 0,
-    right: 0,
-    alignItems: 'center',
-  },
   error: {
     fontSize: 13,
     color: '#e08080',
@@ -558,6 +562,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     paddingHorizontal: 16,
+    backgroundColor: '#0e0e0f',
   },
   resultButtons: {
     flexDirection: 'row',
