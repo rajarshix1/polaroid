@@ -18,7 +18,11 @@ import { CameraView, useCameraPermissions, type FlashMode } from 'expo-camera';
 import { Image } from 'expo-image';
 import * as Haptics from 'expo-haptics';
 import { Ionicons } from '@expo/vector-icons';
-import * as MediaLibrary from 'expo-media-library/legacy';
+import Constants from 'expo-constants';
+
+// Lazy: importing expo-media-library warns (and is useless) in Expo Go,
+// so it is only loaded on demand outside Go. Never import it statically.
+const loadMediaLibrary = () => import('expo-media-library/legacy');
 import { PolaroidCard } from './src/components/PolaroidCard';
 import { ShutterButton } from './src/components/ShutterButton';
 import { DevelopingPhoto } from './src/components/DevelopingPhoto';
@@ -49,10 +53,44 @@ const FLASH_ICON = {
 
 export default function App() {
   const [camPermission, requestCamPermission] = useCameraPermissions();
-  // 'photo' only: Expo Go's manifest lacks the audio permission, and we only shoot stills.
-  const [mediaPermission, requestMediaPermission] = MediaLibrary.usePermissions({
-    granularPermissions: ['photo'],
-  });
+  // Manual media-library state: the usePermissions hook crashes in Expo Go
+  // (its internal check rejects), so every call below is guarded.
+  // In Expo Go the whole module is unavailable -> develop + show, no saving.
+  const isExpoGo = Constants.appOwnership === 'expo';
+  const [mediaState, setMediaState] = useState<{ granted: boolean } | null>(null);
+  const mediaGranted = mediaState?.granted === true;
+
+  const refreshMedia = useCallback(async () => {
+    if (isExpoGo) {
+      setMediaState({ granted: false });
+      return false;
+    }
+    try {
+      const ML = await loadMediaLibrary();
+      const res = await ML.getPermissionsAsync(false, ['photo']);
+      setMediaState({ granted: res.granted });
+      return res.granted;
+    } catch {
+      setMediaState({ granted: false });
+      return false;
+    }
+  }, [isExpoGo]);
+
+  const requestMedia = useCallback(async () => {
+    if (isExpoGo) {
+      setMediaState({ granted: false });
+      return false;
+    }
+    try {
+      const ML = await loadMediaLibrary();
+      const res = await ML.requestPermissionsAsync(false, ['photo']);
+      setMediaState({ granted: res.granted });
+      return res.granted;
+    } catch {
+      setMediaState({ granted: false });
+      return false;
+    }
+  }, [isExpoGo]);
   const [facing, setFacing] = useState<'back' | 'front'>('back');
   const [flash, setFlash] = useState<FlashMode>('off');
   const [cameraReady, setCameraReady] = useState(false);
@@ -71,9 +109,8 @@ export default function App() {
   const cardPhotoSize = Math.floor(width - 48);
 
   const camGranted = camPermission?.granted === true;
-  const mediaGranted = mediaPermission?.granted === true;
 
-  // Ask for camera + storage the moment the app opens.
+  // Ask for camera (+ storage outside Expo Go) the moment the app opens.
   const askAll = useCallback(async () => {
     try {
       if (!camGranted) {
@@ -82,47 +119,58 @@ export default function App() {
     } catch {
       // Surfaced through the gate below.
     }
-    try {
-      if (!mediaGranted) {
-        await requestMediaPermission();
-      }
-    } catch {
-      // Surfaced through the gate below.
+    if (!isExpoGo && !mediaGranted) {
+      await requestMedia();
+    } else if (isExpoGo) {
+      setMediaState({ granted: false });
     }
     setAsked(true);
-  }, [camGranted, mediaGranted, requestCamPermission, requestMediaPermission]);
+  }, [camGranted, mediaGranted, requestCamPermission, requestMedia, isExpoGo]);
 
   useEffect(() => {
     askAll();
   }, [askAll]);
 
-  // Keep asking every time the user returns until everything is granted.
+  // Keep asking for the camera every time the user returns until granted.
+  // Storage is soft: missing library access only disables auto-save, never blocks.
   useEffect(() => {
     const sub = AppState.addEventListener('change', (state) => {
-      if (state === 'active') {
+      if (state === 'active' && !camGranted) {
         askAll();
       }
     });
     return () => sub.remove();
-  }, [askAll]);
+  }, [askAll, camGranted]);
 
-  // Load the persistent Polar album for the film strip.
+  const grantMedia = useCallback(() => {
+    if (isExpoGo) {
+      return;
+    }
+    refreshMedia().then((granted) => {
+      if (!granted) {
+        requestMedia();
+      }
+    });
+  }, [isExpoGo, refreshMedia, requestMedia]);
+
+  // Load the persistent Polar album for the film strip (dev builds only).
   useEffect(() => {
-    if (!mediaGranted) {
+    if (isExpoGo || !mediaGranted) {
       return;
     }
     let cancelled = false;
     (async () => {
       try {
-        const album = await MediaLibrary.getAlbumAsync(ALBUM_TITLE).catch(() => null);
+        const ML = await loadMediaLibrary();
+        const album = await ML.getAlbumAsync(ALBUM_TITLE).catch(() => null);
         if (!album) {
           return;
         }
-        const { assets } = await MediaLibrary.getAssetsAsync({
+        const { assets } = await ML.getAssetsAsync({
           album,
           first: 20,
           mediaType: 'photo',
-          sortBy: [[MediaLibrary.SortBy.creationTime, false]],
+          sortBy: [[ML.SortBy.creationTime, false]],
         });
         if (!cancelled) {
           setFilm(
@@ -136,7 +184,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [mediaGranted]);
+  }, [isExpoGo, mediaGranted]);
 
   const takePhoto = useCallback(async () => {
     if (!cameraRef || !cameraReady || working) {
@@ -167,16 +215,20 @@ export default function App() {
 
       // Auto-save, like a real Polaroid: the print exists the moment it is taken.
       // Saved straight into the album (never moved), so Android never asks to "modify".
-      try {
-        if (!mediaGranted) {
-          await requestMediaPermission();
+      // Skipped in Expo Go, where the media library is unavailable.
+      if (!isExpoGo) {
+        try {
+          if (!mediaGranted) {
+            await requestMedia();
+          }
+          const ML = await loadMediaLibrary();
+          const album =
+            (await ML.getAlbumAsync(ALBUM_TITLE).catch(() => null)) ??
+            (await ML.createAlbumAsync(ALBUM_TITLE).catch(() => null));
+          await ML.createAssetAsync(finished.uri, album ?? undefined);
+        } catch (e) {
+          console.warn('Auto-save failed', e);
         }
-        const album =
-          (await MediaLibrary.getAlbumAsync(ALBUM_TITLE).catch(() => null)) ??
-          (await MediaLibrary.createAlbumAsync(ALBUM_TITLE).catch(() => null));
-        await MediaLibrary.createAssetAsync(finished.uri, album ?? undefined);
-      } catch (e) {
-        console.warn('Auto-save failed', e);
       }
 
       await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
@@ -187,7 +239,7 @@ export default function App() {
     } finally {
       setWorking(false);
     }
-  }, [cameraRef, cameraReady, working, mediaGranted, requestMediaPermission]);
+  }, [cameraRef, cameraReady, working, mediaGranted, requestMedia, isExpoGo]);
 
   const shareShot = useCallback(async () => {
     if (!shot) {
@@ -200,12 +252,11 @@ export default function App() {
     }
   }, [shot]);
 
-  // ---- Permission gate: blocks until camera + storage are both granted ----
-  if (!asked || !camPermission || !mediaPermission || !camGranted || !mediaGranted) {
-    const camBlocked = !!camPermission && !camGranted && !camPermission.canAskAgain;
-    const mediaBlocked =
-      !!mediaPermission && !mediaGranted && !mediaPermission.canAskAgain;
-    const needsSettings = camBlocked || mediaBlocked;
+  // ---- Permission gate: camera is mandatory, storage is optional ----
+  // (Expo Go cannot provide full media-library access, so missing photo
+  // permission only disables auto-save instead of blocking the app.)
+  if (!asked || !camPermission || !camGranted) {
+    const needsSettings = !!camPermission && !camGranted && !camPermission.canAskAgain;
     return (
       <View style={[styles.screen, styles.center]}>
         <Text style={styles.title}>POLAR</Text>
@@ -219,16 +270,8 @@ export default function App() {
             />
             <Text style={styles.permText}>Camera {camGranted ? 'granted' : 'needed'}</Text>
           </View>
-          <View style={styles.permRow}>
-            <Ionicons
-              name={mediaGranted ? 'checkmark-circle' : 'images-outline'}
-              size={22}
-              color={mediaGranted ? '#7fc97f' : '#f5f2e8'}
-            />
-            <Text style={styles.permText}>Photos {mediaGranted ? 'granted' : 'needed'}</Text>
-          </View>
         </View>
-        {asked && (!camGranted || !mediaGranted) && (
+        {asked && !camGranted && (
           <TouchableOpacity
             style={styles.pill}
             onPress={() => {
@@ -244,9 +287,9 @@ export default function App() {
             </Text>
           </TouchableOpacity>
         )}
-        {asked && !needsSettings && (!camGranted || !mediaGranted) && (
+        {asked && !needsSettings && !camGranted && (
           <Text style={[styles.hint, styles.permNote]}>
-            Polar cannot work without these — allow to continue.
+            Polar cannot work without the camera — allow to continue.
           </Text>
         )}
         <StatusBar style="light" />
@@ -262,6 +305,14 @@ export default function App() {
           <PolaroidCard photoSize={cardPhotoSize} caption={shot.caption}>
             <DevelopingPhoto key={shot.uri} uri={shot.uri} size={cardPhotoSize} />
           </PolaroidCard>
+          {!mediaGranted && (
+            <TouchableOpacity style={styles.saveWarn} onPress={isExpoGo ? undefined : grantMedia}>
+              <Ionicons name="images-outline" size={14} color="#e0b46a" />
+              <Text style={styles.saveWarnText}>
+                {isExpoGo ? 'Not saved — needs a dev build.' : 'Not saved to library. Tap to allow.'}
+              </Text>
+            </TouchableOpacity>
+          )}
           <View style={styles.resultButtons}>
             <TouchableOpacity style={styles.pill} onPress={() => setShot(null)}>
               <Text style={styles.pillText}>New photo</Text>
@@ -343,6 +394,16 @@ export default function App() {
           </View>
 
           <View style={styles.blackZone}>
+            {!mediaGranted && (
+              <TouchableOpacity style={styles.saveWarn} onPress={isExpoGo ? undefined : grantMedia}>
+                <Ionicons name="images-outline" size={14} color="#e0b46a" />
+                <Text style={styles.saveWarnText}>
+                  {isExpoGo
+                    ? 'Saving needs a dev build — prints stay in-app for now.'
+                    : "Library blocked — prints won't save. Tap to allow."}
+                </Text>
+              </TouchableOpacity>
+            )}
             <Text style={styles.writeup}>600 FILM · POINT. SHOOT. PRINT.</Text>
             <View style={styles.controls}>
               <TouchableOpacity
@@ -429,6 +490,20 @@ const styles = StyleSheet.create({
     letterSpacing: 3,
     color: '#8a8574',
     textAlign: 'center',
+  },
+  saveWarn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    borderWidth: 1,
+    borderColor: '#6b5a33',
+    borderRadius: 999,
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+  },
+  saveWarnText: {
+    fontSize: 12,
+    color: '#e0b46a',
   },
   permList: {
     marginTop: 28,
